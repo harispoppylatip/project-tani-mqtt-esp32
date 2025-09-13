@@ -10,6 +10,7 @@
 #include <Preferences.h>
 #include <time.h>
 #include <HTTPClient.h>
+#include <math.h>
 
 // ===================== KONFIGURASI PIN =====================
 #define PIN_DS18B20   15
@@ -26,8 +27,8 @@ OneWire oneWire(PIN_DS18B20);
 DallasTemperature sensors(&oneWire);
 
 // ===================== WiFi & MQTT (TLS) =====================
-const char* WIFI_SSID   = "NANABUN";
-const char* WIFI_PASS   = "Alifzah05";
+const char* WIFI_SSID   = "Manunggal";
+const char* WIFI_PASS   = "Jaya3333";
 
 const char* MQTT_HOST   = "d61b7602f60d488a985eb51f2e8a7e65.s1.eu.hivemq.cloud";
 const uint16_t MQTT_PORT = 8883;
@@ -59,16 +60,15 @@ const int SOIL2_WET = 1230;
 const int SOIL2_DRY = 2550;
 
 // ===================== INTERVAL (ms) =====================
-const unsigned long SENSOR_POLL_MS   = 1000;   // baca sensor periodik
-const unsigned long LCD_REFRESH_MS   = 400;    // refresh LCD (lebih jarang -> stabil)
-const unsigned long PAGE_SWITCH_MS   = 2000;   // ganti halaman LCD
-const unsigned long TELEMETRY_MS     = 3000;   // publish MQTT
-const unsigned long SCHEDULE_TICK_MS = 200;    // cek jadwal
-const unsigned long WIFI_RETRY_MS    = 1000;   // coba konek WiFi
-const unsigned long MQTT_RETRY_MS    = 2000;   // coba konek MQTT
-const unsigned long NTP_CHECK_MS     = 5000;   // cek NTP
-const unsigned long PH_SAMPLE_MS     = 100;    // jarak waktu sampling pH
-const unsigned long PH_STALE_MS      = 5000;   // >5s tanpa nilai baru -> tampil "--.-"
+const unsigned long SENSOR_POLL_MS   = 1000;
+const unsigned long PAGE_SWITCH_MS   = 2000;
+const unsigned long TELEMETRY_MS     = 3000;
+const unsigned long SCHEDULE_TICK_MS = 200;
+const unsigned long WIFI_RETRY_MS    = 1000;
+const unsigned long MQTT_RETRY_MS    = 2000;
+const unsigned long NTP_CHECK_MS     = 5000;
+const unsigned long PH_SAMPLE_MS     = 100;
+const unsigned long PH_STALE_MS      = 5000;
 
 #if ENABLE_HTTP_POST
 const unsigned long DB_POST_INTERVAL_MS = 10UL * 60UL * 1000UL; // 10 menit
@@ -112,14 +112,43 @@ struct Schedule {
 
 long last_trigger_minute = -1;
 
-// ===================== pH METHOD (sampling non-blocking) =====================
-float calibration_value = 21.03f; // kalibrasi sesuai kebiasaanmu
+// ===================== KALIBRASI pH (3 TITIK dgn MID=6.80) =====================
+// Ganti angka volt (V) di bawah sesuai hasil stabil kamu:
+float CAL_LOW_PH   = 4.00f;   float CAL_LOW_V  = 3.295f; // pH4
+float CAL_MID_PH   = 6.80f;   float CAL_MID_V  = 2.695f; // pH6.80 (dari log ≈2.683..2.711, ambil 2.695)
+float CAL_HIGH_PH  = 10.00f;  float CAL_HIGH_V = 2.270f; // pH10 (≈9–10 kamu catat)
+
+// Piecewise linear: (LOW <-> MID) dan (MID <-> HIGH)
+static inline float computePhFromVolt(float V) {
+  bool ok_low  = fabs(CAL_LOW_V  - CAL_MID_V ) >= 0.01f;
+  bool ok_high = fabs(CAL_MID_V  - CAL_HIGH_V) >= 0.01f;
+  if (!ok_low && !ok_high) return NAN;
+
+  float ph;
+  if (V >= CAL_MID_V && ok_low) {
+    // sisi asam: (CAL_MID_PH,CAL_MID_V) ↔ (CAL_LOW_PH,CAL_LOW_V)
+    float m = (CAL_LOW_PH - CAL_MID_PH) / (CAL_LOW_V - CAL_MID_V);
+    float b = CAL_MID_PH - m * CAL_MID_V;
+    ph = m * V + b;
+  } else if (V < CAL_MID_V && ok_high) {
+    // sisi basa: (CAL_MID_PH,CAL_MID_V) ↔ (CAL_HIGH_PH,CAL_HIGH_V)
+    float m = (CAL_HIGH_PH - CAL_MID_PH) / (CAL_HIGH_V - CAL_MID_V);
+    float b = CAL_MID_PH - m * CAL_MID_V;
+    ph = m * V + b;
+  } else {
+    return NAN;
+  }
+  return constrain(ph, 0.0f, 14.0f);
+}
+
+// ===================== pH SAMPLING (non-blocking) =====================
 int   ph_buffer[10];
 int   ph_index = 0;
-bool  phReady = false;            // 10 sampel lengkap dan dihitung
-float phValue = NAN;              // nilai pH terakhir
+bool  phReady = false;
+float phValue = NAN;      // nilai pH terakhir
+float phVolt  = NAN;      // tegangan pH terakhir (V)
 unsigned long lastPhSampleMS = 0;
-unsigned long lastPhUpdateMS = 0; // kapan terakhir update pH
+unsigned long lastPhUpdateMS = 0;
 
 // ===================== FORWARD DECLARATIONS =====================
 int   readSoil1Percent();
@@ -140,9 +169,9 @@ void  ensureWiFi();
 void  ensureMQTT();
 void  ensureTime();
 void  drawLCD(float suhuC, float phVal, int soil1Pct, int soil2Pct, bool rly);
-void  publishTelemetry(float suhuC, int soil1Pct, int soil2Pct, float phVal);
+void  publishTelemetry(float suhuC, int soil1Pct, int soil2Pct, float phVal, float phV);
 #if ENABLE_HTTP_POST
-void  postTelemetryToHTTP(float suhuC, int soil1Pct, int soil2Pct, float phVal);
+void  postTelemetryToHTTP(float suhuC, int soil1Pct, int soil2Pct, float phVal, float phV);
 #endif
 
 // ===================== Helper Debug =====================
@@ -201,7 +230,6 @@ void handleScheduleTick() {
 
   long thisMinuteStamp = (long)(nowSec / 60);
 
-  // stop jika sudah selesai
   if (scheduleCfg.running) {
     if (nowSec >= scheduleCfg.run_until) {
       scheduleCfg.running = false;
@@ -212,7 +240,6 @@ void handleScheduleTick() {
     return;
   }
 
-  // trigger sekali pada menit yang ditentukan
   if (localTm.tm_hour == scheduleCfg.hour &&
       localTm.tm_min  == scheduleCfg.minute &&
       last_trigger_minute != thisMinuteStamp) {
@@ -232,11 +259,12 @@ void startPhSampling() {
   phReady = false;
 }
 void tickPhSampling() {
-  if (ph_index >= 10) return;                     // sudah penuh
+  if (ph_index >= 10) return;
   if (millis() - lastPhSampleMS < PH_SAMPLE_MS) return;
   lastPhSampleMS = millis();
   analogSetPinAttenuation(PIN_PH, ADC_11db);
-  ph_buffer[ph_index++] = analogRead(PIN_PH);     // 0..4095
+  ph_buffer[ph_index++] = analogRead(PIN_PH); // 0..4095
+
   if (ph_index >= 10) {
     // sort
     for (int i = 0; i < 9; i++) {
@@ -248,17 +276,21 @@ void tickPhSampling() {
         }
       }
     }
-    // ambil 6 nilai tengah (index 2..7)
+    // 6 nilai tengah (index 2..7)
     unsigned long sum = 0;
     for (int i = 2; i < 8; i++) sum += ph_buffer[i];
 
-    float volt = (float)sum * 3.3f / 4095.0f / 6.0f;     // konversi ke Volt
-    float ph_act = -5.70f * volt + calibration_value;    // rumus lama
-    ph_act = constrain(ph_act, 0.0f, 14.0f);
+    // konversi ADC ke Volt (Vref ~3.3V, 12-bit, divider ~6)
+    float V = (float)sum * 3.3f / 4095.0f / 6.0f;
+    float ph = computePhFromVolt(V);
 
-    phValue = ph_act;
-    phReady = true;            // siap dipakai
-    lastPhUpdateMS = millis(); // tandai saat update terakhir
+    phVolt  = V;
+    phValue = ph;
+    phReady = true;
+    lastPhUpdateMS = millis();
+
+    // DEBUG
+    Serial.printf("[pH] volt=%.4f V  pH_calc=%.2f\n", phVolt, phValue);
   }
 }
 
@@ -276,9 +308,7 @@ int readSoil2Percent() {
   return constrain(percent, 0, 100);
 }
 float readTemperatureC() {
-  // ambil hasil dari konversi sebelumnya
   float t = sensors.getTempCByIndex(0);
-  // minta konversi berikutnya (pipeline)
   sensors.requestTemperatures();
   return t;
 }
@@ -294,7 +324,7 @@ void ensureWiFi() {
   lastWifiTry = millis();
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.println("[WiFi] connecting...");
+  Serial.printf("[WiFi] connecting to %s ...\n", WIFI_SSID);
 }
 void ensureMQTT() {
   if (WiFi.status() != WL_CONNECTED) return;
@@ -303,7 +333,7 @@ void ensureMQTT() {
   lastMqttTry = millis();
 
   secureClient.setTimeout(15);
-  secureClient.setInsecure(); // cepat; ganti setCACert() jika mau verifikasi CA
+  secureClient.setInsecure(); // bisa diganti setCACert()
 
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setBufferSize(512);
@@ -343,7 +373,6 @@ void ensureTime() {
 }
 
 // ===================== LCD (ANTI-FLICKER) & Telemetry =====================
-// Helper: pad/truncate ke 16 kolom
 static inline String fit16(const String& s) {
   if (s.length() >= 16) return s.substring(0, 16);
   String out = s; out.reserve(16);
@@ -351,40 +380,30 @@ static inline String fit16(const String& s) {
   return out;
 }
 
-// Cache line per page supaya hanya update kalau berubah
 void drawLCD(float suhuC, float phVal, int soil1Pct, int soil2Pct, bool rly) {
   static uint8_t page = 0;
   static unsigned long lastPageSwitch = 0;
-
-  // cache teks terakhir ditampilkan (per-row)
   static String lastLine0 = "";
   static String lastLine1 = "";
   static uint8_t lastPageShown = 255;
 
-  // ganti halaman tiap PAGE_SWITCH_MS
   if (millis() - lastPageSwitch >= PAGE_SWITCH_MS) {
     lastPageSwitch = millis();
-    page ^= 1;
+    page = (page + 1) % 2;
   }
 
-  // bentuk string untuk page aktif
   String line0, line1;
-
   if (page == 0) {
-    // Page 0: "R:ON  pH:7.0" | "S1:45% S2:40%"
     line0 = String("Relay:") + (rly ? "ON " : "OFF") + " pH:" + (isnan(phVal) ? String("--.-") : String(phVal, 1));
     line1 = String("S1:") + soil1Pct + "%    S2:" + soil2Pct + "%";
   } else {
-    // Page 1: "Temp:25.1C" | "S1:45% S2:40%"
     line0 = String("Temp:") + ((isnan(suhuC) || suhuC < -100) ? String("--.-C") : String(String(suhuC, 1) + "C"));
     line1 = String("S1:") + soil1Pct + "%    S2:" + soil2Pct + "%";
   }
 
-  // pad/truncate ke 16 kolom
   line0 = fit16(line0);
   line1 = fit16(line1);
 
-  // Jika ganti page, paksa redraw (tanpa clear)
   bool force = (lastPageShown != page);
   if (force || line0 != lastLine0) {
     lcd.setCursor(0, 0);
@@ -396,7 +415,6 @@ void drawLCD(float suhuC, float phVal, int soil1Pct, int soil2Pct, bool rly) {
     lcd.print(line1);
     lastLine1 = line1;
   }
-
   lastPageShown = page;
 }
 
@@ -419,14 +437,15 @@ void publishScheduleState() {
   size_t n = serializeJson(doc, buf, sizeof(buf));
   mqtt.publish(TOPIC_SCH_STATE, buf, n);
 }
-void publishTelemetry(float suhuC, int soil1Pct, int soil2Pct, float phVal) {
-  StaticJsonDocument<256> doc;
+void publishTelemetry(float suhuC, int soil1Pct, int soil2Pct, float phVal, float phV) {
+  StaticJsonDocument<320> doc;
   if (isnan(suhuC) || suhuC < -100) doc["suhu"] = nullptr; else doc["suhu"] = suhuC;
   if (isnan(phVal))                 doc["ph"]   = nullptr; else doc["ph"]   = phVal;
-  doc["kelembapan_tanah"]  = soil1Pct; // soil1
-  doc["kelembapan_tanah2"] = soil2Pct; // soil2
+  if (isnan(phV))                   doc["ph_v"] = nullptr; else doc["ph_v"] = phV; // tegangan pH
+  doc["kelembapan_tanah"]  = soil1Pct;
+  doc["kelembapan_tanah2"] = soil2Pct;
   doc["relay"] = relayState;
-  char buf[280];
+  char buf[360];
   size_t n = serializeJson(doc, buf, sizeof(buf));
   mqtt.publish(TOPIC_TELE, buf, n);
 }
@@ -478,14 +497,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 #if ENABLE_HTTP_POST
-void postTelemetryToHTTP(float suhuC, int soil1Pct, int soil2Pct, float phVal) {
+void postTelemetryToHTTP(float suhuC, int soil1Pct, int soil2Pct, float phVal, float phV) {
   if (WiFi.status() != WL_CONNECTED) return;
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<320> doc;
   if (isnan(suhuC) || suhuC < -100) doc["suhu"] = nullptr; else doc["suhu"] = suhuC;
   if (isnan(phVal))                 doc["ph"]   = nullptr; else doc["ph"]   = phVal;
+  if (isnan(phV))                   doc["ph_v"] = nullptr; else doc["ph_v"] = phV;
   doc["kelembapan_tanah"]  = soil1Pct;
   doc["kelembapan_tanah2"] = soil2Pct;
-  char jsonBuf[280];
+  char jsonBuf[360];
   size_t n = serializeJson(doc, jsonBuf, sizeof(jsonBuf));
   HTTPClient http; WiFiClientSecure https; https.setInsecure();
   if (!http.begin(https, API_URL)) { Serial.println("[HTTP] begin failed"); return; }
@@ -497,22 +517,12 @@ void postTelemetryToHTTP(float suhuC, int soil1Pct, int soil2Pct, float phVal) {
 }
 #endif
 
-// ===================== Timers =====================
-unsigned long tSensor = 0;
-unsigned long tTele   = 0;
-unsigned long tSched  = 0;
-#if ENABLE_HTTP_POST
-unsigned long tHttp   = 0;
-#endif
-
 // ===================== SETUP & LOOP =====================
 void setup() {
   Serial.begin(115200);
 
-  // I2C lebih cepat untuk kurangi flicker
   Wire.begin();
   Wire.setClock(400000);
-
   lcd.init();
   lcd.backlight();
   lcd.noBlink();
@@ -521,10 +531,10 @@ void setup() {
   lcd.setCursor(0, 1); lcd.print("WiFi+MQTT TLS...");
 
   pinMode(PIN_RELAY, OUTPUT);
-  setRelay(false); // default OFF
+  setRelay(false);
 
   sensors.begin();
-  sensors.requestTemperatures(); // seed pertama
+  sensors.requestTemperatures();
 
   ensureWiFi();
   ensureMQTT();
@@ -537,18 +547,16 @@ void setup() {
 
   publishScheduleState();
 
-  startPhSampling(); // mulai siklus pH
-  lastPhUpdateMS = 0; // awalnya belum ada data pH
+  startPhSampling();
+  lastPhUpdateMS = 0;
 }
 
 void loop() {
-  // konektivitas
   ensureWiFi();
   ensureMQTT();
   ensureTime();
   mqtt.loop();
 
-  // sampling pH non-blocking
   tickPhSampling();
 
   const unsigned long nowMS = millis();
@@ -561,7 +569,7 @@ void loop() {
   if (nowMS - tSensor >= SENSOR_POLL_MS) {
     tSensor = nowMS;
 
-    float suhuRaw  = readTemperatureC();  // pipeline DS18B20
+    float suhuRaw  = readTemperatureC();
     int   soil1Raw = readSoil1Percent();
     int   soil2Raw = readSoil2Percent();
 
@@ -569,7 +577,7 @@ void loop() {
     maSoil1.add((float)soil1Raw);
     maSoil2.add((float)soil2Raw);
 
-    cachedSuhu  = isnan(maTemp.value())    ? suhuRaw   : maTemp.value();
+    cachedSuhu  = isnan(maTemp.value())       ? suhuRaw   : maTemp.value();
     cachedSoil1 = (int)round(isnan(maSoil1.value()) ? soil1Raw : maSoil1.value());
     cachedSoil2 = (int)round(isnan(maSoil2.value()) ? soil2Raw : maSoil2.value());
   }
@@ -581,7 +589,7 @@ void loop() {
     handleScheduleTick();
   }
 
-  // --- LCD refresh (anti-flicker): cukup panggil tiap loop, drawLCD internal yang bandingkan teks) ---
+  // --- LCD refresh (anti-flicker) ---
   float phShow = (!isnan(phValue) && (nowMS - lastPhUpdateMS <= PH_STALE_MS)) ? phValue : NAN;
   drawLCD(cachedSuhu, phShow, cachedSoil1, cachedSoil2, relayState);
 
@@ -593,27 +601,28 @@ void loop() {
     if (timeReady) {
       time_t nowSec = time(nullptr);
       struct tm localTm; localtime_r(&nowSec, &localTm);
-      Serial.printf("%04d-%02d-%02d %02d:%02d:%02d WITA | pH=%s | T=%.1fC | Soil1=%d%% | Soil2=%d%% | Relay=%s\n",
+      Serial.printf("%04d-%02d-%02d %02d:%02d:%02d WITA | pH=%s (V=%s) | T=%.1fC | Soil1=%d%% | Soil2=%d%% | Relay=%s\n",
                     localTm.tm_year + 1900, localTm.tm_mon + 1, localTm.tm_mday,
                     localTm.tm_hour, localTm.tm_min, localTm.tm_sec,
                     ((!isnan(phValue) && (nowMS - lastPhUpdateMS <= PH_STALE_MS)) ? String(phValue, 2).c_str() : "--.-"),
+                    (!isnan(phVolt) ? String(phVolt, 3).c_str() : "--"),
                     cachedSuhu, cachedSoil1, cachedSoil2, (relayState ? "ON" : "OFF"));
     } else {
       Serial.println("Waktu belum siap (NTP)...");
     }
 
-    float phForPublish = (!isnan(phValue) && (nowMS - lastPhUpdateMS <= PH_STALE_MS)) ? phValue : NAN;
-    publishTelemetry(cachedSuhu, cachedSoil1, cachedSoil2, phForPublish);
+    float phForPublish  = (!isnan(phValue) && (nowMS - lastPhUpdateMS <= PH_STALE_MS)) ? phValue : NAN;
+    float phVForPublish = (!isnan(phVolt)) ? phVolt : NAN;
+    publishTelemetry(cachedSuhu, cachedSoil1, cachedSoil2, phForPublish, phVForPublish);
 
 #if ENABLE_HTTP_POST
     static unsigned long tHttp = 0;
     if (nowMS - tHttp >= DB_POST_INTERVAL_MS) {
       tHttp = nowMS;
-      postTelemetryToHTTP(cachedSuhu, cachedSoil1, cachedSoil2, phForPublish);
+      postTelemetryToHTTP(cachedSuhu, cachedSoil1, cachedSoil2, phForPublish, phVForPublish);
     }
 #endif
 
-    // mulai ulang siklus pH agar nilai selalu terbaru
-    startPhSampling();
+    startPhSampling(); // ulang siklus pH
   }
 }
